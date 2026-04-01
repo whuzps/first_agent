@@ -1,0 +1,114 @@
+# =========================
+# 通用系统与编辑器文件
+# =========================
+.DS_Store
+Thumbs.db
+ehthumbs.db
+*.swp
+*.swo
+*~
+
+.idea/
+.trae/
+.vscode/*
+.cursor/
+!.vscode/extensions.json
+
+# =========================
+# Python 运行与构建产物
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+
+build/
+dist/
+*.egg-info/
+*.egg
+.Python
+pip-wheel-metadata/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+service/venv/
+service/.venv/
+service/.bench_venv/
+
+# 类型检查/测试缓存
+.cache/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# 覆盖率报告
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# =========================
+# 前端依赖与构建产物
+# =========================
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# =========================
+# 运行日志与临时文件
+# =========================
+*.log
+logs/
+service/logs/*.log
+service/logs/**/*.log
+*.tmp
+*.temp
+
+# =========================
+# 环境变量与本地敏感配置
+# =========================
+.env
+.env.*
+!.env.example
+!.env.template
+
+# =========================
+# 本项目业务数据与持久化产物
+# （LangGraph/客服Agent 运行时文件）
+# =========================
+# SQLite/DB 文件
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+
+# 服务侧运行数据库与检查点
+service/tenants/**/db/
+service/tenants/**/checkpoints/
+
+# 向量索引与中间数据
+service/data/temp/
+service/data/uploads/
+
+# RAG 评估/报表产物
+service/logs/ragas_reports/
+
+# 其他本地运行数据
+service/backup/
+
+# =========================
+# 保留需纳入版本管理的目录说明
+# =========================
+# 文档目录保留：service/docs/
+# 测试目录保留：service/tests/

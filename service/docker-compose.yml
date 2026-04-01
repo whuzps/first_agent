@@ -1,0 +1,273 @@
+# 使用 Compose 最新规范（不写 version 字段），为 service 目录提供容器编排
+# 目标：持久化日志、数据库、上传文件；通过 .env 管理敏感配置；健康检查、依赖与重启策略
+#
+# 启动：docker compose up -d
+# 停止：docker compose down
+# 查看日志：docker compose logs -f app
+#
+# 新增服务（消息队列削峰）：
+#   rabbitmq   - 消息 Broker（含管理后台 http://localhost:15672，guest/guest）
+#   celery     - Celery Worker，消费 chat_queue，执行 LangGraph 图
+#   celery_dlq - DLQ 监控 Worker，仅消费 chat_dlq（死信队列），打印告警日志
+#
+# 兜底机制：
+#   若 RabbitMQ 不可用，熔断器自动切换降级模式（FastAPI 进程内直接执行 + Redis Stream）
+#   若 Redis 不可用，回退到完全内联执行模式（与引入消息队列之前行为完全一致）
+
+name: cs-agent-stack
+
+# ========== 公共环境变量（所有服务共用）==========
+x-common-env: &common-env
+  # ---- LLM / Embedding ----
+  MODEL_NAME: ${MODEL_NAME:-qwen-plus}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-v4}
+  DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+  # ---- Milvus 向量库 ----
+  MILVUS_HOST: ${MILVUS_HOST:-milvus}
+  MILVUS_PORT: ${MILVUS_PORT:-19530}
+  MILVUS_TOKEN: ${MILVUS_TOKEN:-}
+  COLLECTION_NAME: ${COLLECTION_NAME:-rag_test_v1}
+  MEMORY_COLLECTION_NAME: ${MEMORY_COLLECTION_NAME:-memory_test_v1}
+  # ---- 数据库 ----
+  ORDERS_DB_PATH: ${ORDERS_DB_PATH:-}
+  CHECKPOINT_DB_PATH: ${CHECKPOINT_DB_PATH:-}
+  SUPPORT_DB_PATH: ${SUPPORT_DB_PATH:-}
+  LONG_TERM_MEMORY_DB_PATH: ${LONG_TERM_MEMORY_DB_PATH:-}
+  TENANTS_BASE_DIR: ${TENANTS_BASE_DIR:-/app/tenants}
+  POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://postgres:postgres@postgres:5432/first_agent}
+  # ---- Redis / 认证 ----
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  JWT_SECRET: ${JWT_SECRET:-cs-agent-jwt-secret-2025}
+  # ---- RabbitMQ（消息队列）----
+  RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672//}
+  MQ_ENABLED: ${MQ_ENABLED:-true}
+  # ---- 业务 ----
+  HUMAN_SUPPORT_URL: ${HUMAN_SUPPORT_URL:-}
+  # ---- LangSmith 追踪（可选）----
+  LANGCHAIN_TRACING_V2: ${LANGCHAIN_TRACING_V2:-false}
+  LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY:-}
+  LANGCHAIN_PROJECT: ${LANGCHAIN_PROJECT:-智能客服}
+
+services:
+  app:
+    image: python:3.11-slim
+    working_dir: /app
+    environment:
+      <<: *common-env
+    # 容器启动前安装依赖，然后启动 FastAPI（端口 8000）
+    command: >-
+      sh -c "pip install --no-cache-dir -r /app/requirements.txt uvicorn[standard]
+      && python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "${APP_PORT:-8000}:8000"
+      - "${PROM_PORT:-9090}:9090"
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+      - ./app/logs:/app/app/logs
+      - ./tenants:/app/tenants
+      - ./app/data/uploads:/app/app/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; import sys; sys.exit(0) if urlopen('http://localhost:8000/health').getcode()==200 else sys.exit(1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ========== Celery Worker（主聊天队列）==========
+  # 负责消费 chat_queue，执行 LangGraph 图并通过 Redis Stream 推送 token
+  celery:
+    image: python:3.11-slim
+    working_dir: /app
+    environment:
+      <<: *common-env
+    command: >-
+      sh -c "pip install --no-cache-dir -r /app/requirements.txt
+      && celery -A celery_app worker
+         --queues=chat_queue
+         --concurrency=${CELERY_CONCURRENCY:-4}
+         --loglevel=info
+         --hostname=celery-worker@%%h"
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+      - ./tenants:/app/tenants
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A celery_app inspect ping -d celery-worker@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    # 水平扩展（非 Swarm 模式）：docker compose up -d --scale celery=3
+
+  # ========== Celery DLQ Worker（死信队列监控）==========
+  # 仅消费 chat_dlq，打印死信告警日志，不重试执行
+  celery_dlq:
+    image: python:3.11-slim
+    working_dir: /app
+    environment:
+      <<: *common-env
+    command: >-
+      sh -c "pip install --no-cache-dir -r /app/requirements.txt
+      && celery -A celery_app worker
+         --queues=chat_dlq
+         --concurrency=1
+         --loglevel=warning
+         --hostname=celery-dlq@%%h"
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ========== RabbitMQ（消息 Broker）==========
+  # Management 后台：http://localhost:15672（guest/guest）
+  # 高峰期通过队列 x-max-length 防止消息无限堆积
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-guest}
+      # 开启磁盘告警阈值（可用磁盘 < 200MB 时拒绝新消息）
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit disk_free_limit {mem_relative,0.1}"
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ========== PostgreSQL（持久化存储：订单、工单、Checkpoint 等）==========
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-first_agent}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # Redis Stack：会话缓存、分布式限流、Redis Stream（token 推送）+ RediSearch 向量搜索（语义缓存）
+  # ⚠️ 语义缓存依赖 RediSearch 模块，必须使用 redis-stack-server 而非 redis:7-alpine
+  redis:
+    image: redis/redis-stack-server:7.2.0-v13
+    environment:
+      # 禁用持久化（AOF/RDB），开启 LRU 淘汰（与原 redis:7-alpine 行为一致）
+      REDIS_ARGS: "--save '' --appendonly no --maxmemory 512mb --maxmemory-policy allkeys-lru"
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Milvus Standalone：向量检索引擎（RAG + 长期记忆）
+  # 生产环境建议使用 Milvus 集群模式或托管服务，此处为开发/测试配置
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd_data:/etcd
+    command: >-
+      etcd
+      -advertise-client-urls=http://127.0.0.1:2379
+      -listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+
+  milvus:
+    image: milvusdb/milvus:v2.4.17
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    ports:
+      - "${MILVUS_PORT:-19530}:19530"
+      - "${MILVUS_GRPC_PORT:-9091}:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
+  rabbitmq_data:
