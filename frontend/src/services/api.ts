@@ -10,7 +10,7 @@ import type {
   SuggestionEvent,
 } from '../types/api'
 import type { AuthPayload, LoginResponse, User } from '../types/auth'
-import type { ChatResponse, SessionMeta, Source } from '../types/chat'
+import type { ChatResponse, HitlInfo, SessionMeta, Source } from '../types/chat'
 
 const http = axios.create({ baseURL: '', timeout: 120_000 })
 
@@ -75,6 +75,12 @@ export async function sendMessage(body: {
   return data
 }
 
+/** HITL 高危操作确认 */
+export async function confirmHitl(body: { thread_id: string; decision: 'approved' | 'rejected' }) {
+  const { data } = await http.post<ChatResponse>('/chat/confirm', body)
+  return data
+}
+
 /** SSE 流式完成事件 */
 export interface StreamDoneEvent {
   type: 'done'
@@ -84,12 +90,23 @@ export interface StreamDoneEvent {
   trace_id?: string
 }
 
+/** SSE 流式 HITL 确认事件 */
+export interface StreamHitlEvent {
+  type: 'hitl_confirm'
+  message: string
+  operations: string[]
+  order_id: string
+  thread_id: string
+  trace_id?: string
+}
+
 /** 流式发送聊天消息（POST SSE），逐 token 回调 */
 export async function sendMessageStream(
   body: Parameters<typeof sendMessage>[0],
   onToken: (content: string) => void,
   onDone: (data: StreamDoneEvent) => void,
   onError?: (message: string) => void,
+  onHitl?: (data: StreamHitlEvent) => void,
 ): Promise<void> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   const token = localStorage.getItem('auth_token')
@@ -132,6 +149,7 @@ export async function sendMessageStream(
         const evt = JSON.parse(line.slice(6))
         if (evt.type === 'token') onToken(evt.content)
         else if (evt.type === 'done') onDone(evt as StreamDoneEvent)
+        else if (evt.type === 'hitl_confirm') onHitl?.(evt as StreamHitlEvent)
         else if (evt.type === 'error') onError?.(evt.message)
       } catch { /* 忽略解析错误 */ }
     }

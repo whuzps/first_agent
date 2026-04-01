@@ -292,7 +292,7 @@ RAG 管线采用「混合召回 → Rerank 重排 → Parent Expansion 扩展」
 
 **文件**：`graph/graph.py`（`order_node` + `_react_order_loop`）
 
-订单节点支持 **ReAct（Reasoning + Acting）** 推理模式，通过「思考 → 行动 → 观察」循环实现多步推理和自我纠错。可通过环境变量 `REACT_ENABLED`（默认 `true`）开关，`REACT_MAX_ITERATIONS`（默认 `3`）控制最大迭代次数。
+订单节点支持 **ReAct（Reasoning + Acting）** 推理模式，通过「思考 → 行动 → 观察」循环实现多步推理和自我纠错。可通过环境变量 `REACT_ENABLED`（默认 `true`）开关，`REACT_MAX_ITERATIONS` 控制最大迭代次数。
 
 **ReAct 推理循环流程：**
 

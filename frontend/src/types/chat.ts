@@ -25,6 +25,8 @@ export interface Message {
   suggestions?: string[]
   error?: string
   quotedMessage?: QuotedMessage
+  /** HITL 高危操作确认信息 */
+  hitl?: HitlInfo
 }
 
 /** 会话元数据（列表用） */
@@ -56,6 +58,14 @@ export interface SendMessageParams {
   quotedMessage?: QuotedMessage
 }
 
+/** HITL 高危操作确认信息 */
+export interface HitlInfo {
+  thread_id: string
+  operations: string[]
+  order_id: string
+  requires_confirmation: boolean
+}
+
 /** 聊天响应 */
 export interface ChatResponse {
   route: string
@@ -63,4 +73,6 @@ export interface ChatResponse {
   sources?: Source[]
   suggestions?: string[]
   error?: string
+  /** 高危操作待确认信息（route="hitl_confirm" 时存在） */
+  hitl?: HitlInfo
 }

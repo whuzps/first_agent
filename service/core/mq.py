@@ -278,6 +278,38 @@ async def run_direct_to_stream(
             await _write(event)
 
         result = graph_task.result()
+
+        # ── HITL 中断检测：图被 interrupt() 暂停，需将确认提示写入 Stream ──
+        if isinstance(result, dict) and result.get("__interrupted__"):
+            interrupt_info = result.get("__interrupt_info__") or {}
+            _msg = interrupt_info.get("message", "即将执行高危操作，请确认是否继续？")
+            _ops = interrupt_info.get("operations", [])
+            _oid = interrupt_info.get("order_id", "")
+            _tid = state_dict["thread_id"]
+            hitl_state = await register_hitl_pending(
+                thread_id=_tid, order_id=_oid,
+                operations=_ops, message=_msg,
+            )
+            hitl_event = {
+                "type": "hitl_confirm",
+                "message": _msg,
+                "operations": _ops,
+                "order_id": _oid,
+                "thread_id": _tid,
+                "trace_id": trace_id,
+                "expires_at": hitl_state.get("expires_at"),
+                "timeout_seconds": HITL_TIMEOUT,
+            }
+            await _write(hitl_event)
+            logger.info(f"[MQ降级] HITL 中断，hitl_confirm 事件已写入: task_id={task_id}")
+
+            await r_async.setex(
+                task_key, TASK_TTL,
+                json.dumps({"status": "interrupted", "task_id": task_id, "updated_at": int(time.time())},
+                           ensure_ascii=False),
+            )
+            return
+
         route, answer, sources = determine_answer_fn(result)
 
         # 非流式路径（订单/工单等）
@@ -351,3 +383,81 @@ async def read_task_status(task_id: str) -> Optional[dict]:
     except Exception as e:
         logger.warning(f"[MQ] 查询任务状态失败: task_id={task_id}, error={e}")
         return None
+
+
+# ========== HITL 挂起状态管理（Redis）==========
+
+HITL_KEY_PREFIX = "chat:hitl:"
+HITL_TIMEOUT = int(os.getenv("HITL_TIMEOUT_SECONDS", "300"))  # 默认 5 分钟
+
+
+async def register_hitl_pending(
+    thread_id: str,
+    order_id: str = "",
+    operations: list = None,
+    message: str = "",
+) -> dict:
+    """HITL 中断发生时，在 Redis 中注册挂起状态（带 TTL 自动过期）。
+
+    Returns:
+        包含 created_at / expires_at 的状态字典（供 hitl_confirm 事件携带给前端）
+    """
+    import redis.asyncio as aioredis
+
+    now = int(time.time())
+    expires_at = now + HITL_TIMEOUT
+    hitl_state = {
+        "thread_id": thread_id,
+        "order_id": order_id,
+        "operations": operations or [],
+        "message": message,
+        "created_at": now,
+        "expires_at": expires_at,
+        "status": "pending",
+    }
+    key = f"{HITL_KEY_PREFIX}{thread_id}"
+    try:
+        r = aioredis.from_url(REDIS_URL, decode_responses=True)
+        try:
+            await r.setex(key, HITL_TIMEOUT, json.dumps(hitl_state, ensure_ascii=False))
+            logger.info(f"[HITL] 注册挂起状态: thread_id={thread_id}, expires_at={expires_at}")
+        finally:
+            await r.aclose()
+    except Exception as e:
+        logger.warning(f"[HITL] Redis 注册失败（非致命）: thread_id={thread_id}, error={e}")
+    return hitl_state
+
+
+async def get_hitl_pending(thread_id: str) -> Optional[dict]:
+    """查询指定 thread 是否有 HITL 挂起状态（未过期）。"""
+    import redis.asyncio as aioredis
+
+    key = f"{HITL_KEY_PREFIX}{thread_id}"
+    try:
+        r = aioredis.from_url(REDIS_URL, decode_responses=True)
+        try:
+            val = await r.get(key)
+            if val is None:
+                return None
+            return json.loads(val)
+        finally:
+            await r.aclose()
+    except Exception as e:
+        logger.warning(f"[HITL] 查询挂起状态失败: thread_id={thread_id}, error={e}")
+        return None
+
+
+async def clear_hitl_pending(thread_id: str) -> None:
+    """清除 HITL 挂起状态（用户已确认/拒绝/自动过期 后调用）。"""
+    import redis.asyncio as aioredis
+
+    key = f"{HITL_KEY_PREFIX}{thread_id}"
+    try:
+        r = aioredis.from_url(REDIS_URL, decode_responses=True)
+        try:
+            await r.delete(key)
+            logger.info(f"[HITL] 清除挂起状态: thread_id={thread_id}")
+        finally:
+            await r.aclose()
+    except Exception as e:
+        logger.warning(f"[HITL] 清除挂起状态失败: thread_id={thread_id}, error={e}")

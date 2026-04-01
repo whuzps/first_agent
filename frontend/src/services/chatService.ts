@@ -1,5 +1,6 @@
 import * as api from './api'
-import type { ChatResponse, SendMessageParams } from '../types/chat'
+import type { StreamHitlEvent } from './api'
+import type { ChatResponse, HitlInfo, SendMessageParams } from '../types/chat'
 import type { SuggestionEvent } from '../types/api'
 
 let currentES: EventSource | null = null
@@ -20,7 +21,8 @@ export async function sendMessage(
   if (params.quotedMessage) body.quoted_message = params.quotedMessage.content
 
   const resp = await api.sendMessage(body as Parameters<typeof api.sendMessage>[0])
-  if (!resp.answer && resp.answer !== '') throw new Error('服务返回异常')
+  // HITL 响应不需要 answer，正常响应需要
+  if (!resp.hitl && !resp.answer && resp.answer !== '') throw new Error('服务返回异常')
   return resp
 }
 
@@ -31,6 +33,7 @@ export async function sendMessageStream(
   onToken: (content: string) => void,
   onDone: (resp: ChatResponse) => void,
   onError?: (message: string) => void,
+  onHitl?: (info: HitlInfo, message: string) => void,
 ): Promise<void> {
   const body: Record<string, unknown> = { query: params.content }
   if (threadId) body.thread_id = threadId
@@ -52,7 +55,23 @@ export async function sendMessageStream(
         sources: data.sources,
       }),
     onError,
+    (evt: StreamHitlEvent) => {
+      onHitl?.({
+        thread_id: evt.thread_id,
+        operations: evt.operations,
+        order_id: evt.order_id,
+        requires_confirmation: true,
+      }, evt.message)
+    },
   )
+}
+
+/** HITL 高危操作确认 */
+export async function confirmHitl(
+  threadId: string,
+  decision: 'approved' | 'rejected',
+): Promise<ChatResponse> {
+  return api.confirmHitl({ thread_id: threadId, decision })
 }
 
 /** 开始建议流 */

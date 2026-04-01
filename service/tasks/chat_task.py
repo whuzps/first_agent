@@ -88,17 +88,18 @@ def _set_task_status(r: _redis_sync.Redis, task_id: str, status: str, extra: Opt
 
 
 def _is_already_done(r: _redis_sync.Redis, task_id: str) -> bool:
-    """幂等检查：若 Stream 中最后一条事件是 done，说明已成功处理完毕，跳过重复执行
+    """幂等检查：若 Stream 中最后一条事件是 done 或 hitl_confirm，跳过重复执行
     
-    注意：仅检查 done，不检查 error。
+    注意：仅检查 done / hitl_confirm，不检查 error。
     error 表示上一次执行失败，重试时应该重新执行（需先清理旧 Stream 避免 token 重复）。
+    hitl_confirm 表示图已正确中断等待用户确认，不应重复执行。
     """
     try:
         stream_key = f"{STREAM_KEY_PREFIX}{task_id}"
         last = r.xrevrange(stream_key, count=1)
         if last:
             event = json.loads(last[0][1].get("event", "{}"))
-            if event.get("type") == "done":
+            if event.get("type") in ("done", "hitl_confirm"):
                 return True
     except Exception:
         pass
@@ -213,6 +214,34 @@ def execute_chat(self: Task, task_id: str, state_dict: dict, trace_id: str) -> d
 
             # 获取最终结果
             result = graph_task.result()
+
+            # ── HITL 中断检测：图被 interrupt() 暂停，需将确认提示写入 Stream ──
+            if isinstance(result, dict) and result.get("__interrupted__"):
+                interrupt_info = result.get("__interrupt_info__") or {}
+                _msg = interrupt_info.get("message", "即将执行高危操作，请确认是否继续？")
+                _ops = interrupt_info.get("operations", [])
+                _oid = interrupt_info.get("order_id", "")
+                _tid = state_dict["thread_id"]
+                # 在 Redis 中注册 HITL 挂起状态（带 TTL）
+                from core.mq import register_hitl_pending, HITL_TIMEOUT
+                hitl_state = await register_hitl_pending(
+                    thread_id=_tid, order_id=_oid,
+                    operations=_ops, message=_msg,
+                )
+                hitl_event = {
+                    "type": "hitl_confirm",
+                    "message": _msg,
+                    "operations": _ops,
+                    "order_id": _oid,
+                    "thread_id": _tid,
+                    "trace_id": trace_id,
+                    "expires_at": hitl_state.get("expires_at"),
+                    "timeout_seconds": HITL_TIMEOUT,
+                }
+                _write_stream(r, task_id, hitl_event)
+                logger.info(f"[Worker] HITL 中断，hitl_confirm 事件已写入: task_id={task_id}")
+                return {"answer": "", "route": "hitl", "interrupted": True}
+
             route, answer, sources = determine_answer(result)
 
             # 非流式路径（订单查询/人工接待等）：一次性写入完整回答
@@ -234,6 +263,12 @@ def execute_chat(self: Task, task_id: str, state_dict: dict, trace_id: str) -> d
 
         # Celery 同步任务中运行 asyncio 代码
         run_result = asyncio.run(_run())
+
+        # HITL 中断时跳过后处理（图尚未完成，用户确认后恢复时再处理）
+        if run_result.get("interrupted"):
+            _set_task_status(r, task_id, "interrupted")
+            logger.info(f"[Worker] HITL 中断，跳过后处理: task_id={task_id}")
+            return {"status": "interrupted", "task_id": task_id}
 
         # ---------- 后处理（消息历史、摘要、长期记忆）----------
         async def _post_process():

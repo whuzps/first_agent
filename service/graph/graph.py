@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 from contextvars import ContextVar as _CtxVar
 from typing_extensions import Literal
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
 from pydantic import BaseModel, Field
 from core.hander import validate_order_id_format
 from core.observability import MetricsCollector
@@ -43,15 +44,13 @@ logger = logging.getLogger(__name__)
 
 使用 LangGraph 构建状态机，利用并行 fan-out/fan-in 机制优化记忆加载性能：
 
-并行分支结构：
-  START ──┬── load_memory(短期记忆) → intent(意图识别) ──┬── intent_post(汇合) → 路由分发
-          └── load_long_term_memory(长期记忆) ──────────┘
+并行分支结构（两条分支深度一致，确保 fan-in 只执行一次）：
+  START ──┬── load_memory_and_intent(短期记忆+意图识别) ──┬── intent_post(汇合) → 路由分发
+          └── load_long_term_memory(长期记忆) ────────────┘
 
 节点说明：
-- load_memory 节点：加载短期记忆（最近 N 轮原文 + 历史摘要）
+- load_memory_and_intent 节点：短期记忆加载 + 意图识别（合并为单节点，保证分支深度一致）
 - load_long_term_memory 节点：加载长期记忆（语义检索用户画像/偏好/历史事实），与分支 1 并行执行
-- intent 节点：多阶段意图识别（规则快速路径 → LLM 联合识别 → 意图转移感知 → 置信度校准 → 槽位校验）
-  意图分类：faq（知识库问答）/ order（订单操作）/ chitchat（闲聊）/ human（转人工）
 - intent_post 节点：并行分支汇合点，合并意图识别结果与长期记忆
 - kb 节点：检索知识库并回答（faq 意图）
 - order 节点：查询订单并生成客服话术（order 意图，含 order_id/action/address 槽位）
@@ -120,7 +119,19 @@ _INTENT_CONFIDENCE_THRESHOLD = float(os.getenv("INTENT_CONFIDENCE_THRESHOLD", "0
 # 是否启用 ReAct 推理模式（可通过环境变量关闭，降级回单次调用模式）
 _REACT_ENABLED = os.getenv("REACT_ENABLED", "true").lower() in ("true", "1", "yes")
 # ReAct 推理最大迭代次数（防止无限循环）
-_REACT_MAX_ITERATIONS = int(os.getenv("REACT_MAX_ITERATIONS", "3"))
+_REACT_MAX_ITERATIONS = int(os.getenv("REACT_MAX_ITERATIONS", "5"))
+
+# ── HITL 高危操作配置 ──
+# 需要用户二次确认的高危工具名称集合
+DANGEROUS_TOOLS: set = {"cancel_order", "apply_refund", "modify_order_address"}
+# 高危工具中文描述映射，用于生成确认话术
+_DANGEROUS_TOOL_DESC: Dict[str, str] = {
+    "cancel_order": "取消订单",
+    "apply_refund": "申请退款",
+    "modify_order_address": "修改收货地址",
+}
+# 是否启用 HITL（可通过环境变量关闭）
+_HITL_ENABLED = os.getenv("HITL_ENABLED", "true").lower() in ("true", "1", "yes")
 
 # 各意图的必需槽位定义
 _REQUIRED_SLOTS: Dict[str, list] = {
@@ -257,17 +268,25 @@ def init_node_state(state: State, node_name: str):
     """
     state.status = StateStatus.RUNNING
     state.error = None
-    # state.ask_human = None
-    # state.kb_answer = None
-    # state.human_handoff = None
-    # state.order_summary = None
-    # state.sources = None
-    # state.fallback = None
-    # state.rewritten_query = None
-    # state.long_term_memory = None
-    # state.clarify_question = None
-    # state.reasoning_trace = []
+    state.ask_human = None
+    state.kb_answer = None
+    state.human_handoff = None
+    state.order_summary = None
+    state.sources = None
+    state.fallback = None
+    state.rewritten_query = None
+    state.long_term_memory = None
+    state.clarify_question = None
+    state.reasoning_trace = []
+    state.hitl_pending = None
     logger.info(f"进入节点: {node_name}")
+    
+
+async def dummy_node(state: State) -> Dict[str, Any]:
+    """dummy节点：空节点，用于占位。"""
+    logger.info("进入节点: dummy节点")
+    return state
+
 
 async def load_memory_node(state: State) -> Dict[str, Any]:
     """加载短期记忆节点：最近 N 轮原文 + 历史摘要。
@@ -496,8 +515,8 @@ def _extract_slots_from_keywords(intent: str, query: str) -> dict:
             slots["order_id"] = oid.group()
         # 动作推断
         action_map = [
-            (["取消订单", "帮我取消", "给我取消"], "cancel"),
-            (["申请退款", "发起退款", "提交退款", "帮我退款", "给我退款"], "refund"),
+            (["取消订单", "帮我取消", "给我取消", "取消"], "cancel"),
+            (["申请退款", "发起退款", "提交退款", "帮我退款", "给我退款", "退款"], "refund"),
             (["修改地址", "改地址", "修改收货地址", "改收货地址", "帮我修改", "帮我改", "给我修改"], "modify_address"),
             (["查看物流", "查物流", "物流到哪了", "追踪包裹"], "logistics"),
             (["怎么还没发货", "订单还没发"], "logistics"),
@@ -649,6 +668,15 @@ async def intent_node(state: State) -> Dict[str, Any]:
         await metrics_collector.track_node_execution("intent_node", time.perf_counter() - _start, success=False)
         state.status = StateStatus.FAILED
         return state
+
+
+async def load_memory_and_intent_node(state: State) -> Dict[str, Any]:
+    """并行分支1：短期记忆加载 → 意图识别（顺序执行，合并为单个图节点）。
+
+    将 load_memory_node 和 intent_node 合并到同一个图节点中，确保该分支与 load_long_term_memory 分支深度一致
+    """
+    await load_memory_node(state)
+    return await intent_node(state)
 
 
 async def _llm_intent_slot(query: str, history: str = None) -> dict:
@@ -1057,6 +1085,8 @@ async def _react_order_loop(
         # ── Action：强制注入 order_id / tenant_id，记录行动 ──
         _t0 = time.perf_counter()
         called_tool_names = []
+        safe_calls = []        # 安全工具调用
+        dangerous_calls = []   # 高危工具调用（需 HITL 确认）
         for call in tool_calls:
             args = call.get("args", {})
             tool_name = call.get("name")
@@ -1079,10 +1109,50 @@ async def _react_order_loop(
                 await stream_queue.put({
                     "type": "react_step", "step": step, "phase": "action", "content": action_desc
                 })
+
+            # HITL：按安全/高危分类
+            if _HITL_ENABLED and tool_name in DANGEROUS_TOOLS:
+                dangerous_calls.append(call)
+            else:
+                safe_calls.append(call)
         _t_inject = time.perf_counter() - _t0
         _t_arg_inject_total += _t_inject
 
-        # ── Observation：执行工具（受熔断器保护），记录观察 ──
+        # ── HITL 中断：检测到高危工具调用，暂停 ReAct 循环 ──
+        if dangerous_calls:
+            logger.info(
+                f"ReAct 第{step}步 [HITL] 检测到高危工具调用: "
+                f"{[c.get('name') for c in dangerous_calls]}，暂停等待用户确认"
+            )
+            # 先执行安全工具调用（如有）
+            if safe_calls:
+                _t0 = time.perf_counter()
+                safe_messages = await _order_tools_breaker.call(
+                    executor.execute_with_fallback, safe_calls, state_ctx
+                )
+                _t_tool = time.perf_counter() - _t0
+                _t_tool_exec_total += _t_tool
+                for tc, tm in zip(safe_calls, safe_messages):
+                    observation = tm.content
+                    reasoning_trace.append({"step": step, "type": "observation", "content": observation})
+                    logger.info(f"ReAct 第{step}步 [安全工具观察]: {observation[:150]}...")
+                    messages.append(LCToolMessage(
+                        content=observation,
+                        tool_call_id=tc.get("id", f"react_{step}_safe")
+                    ))
+
+            # 从思考内容中提取 LLM 给出的部分回复（如有）
+            partial_answer = thought if thought else ""
+
+            # 返回带有高危待确认调用的结果，ReAct 循环在此中止
+            _loop_elapsed = time.perf_counter() - _loop_start
+            logger.info(
+                f"⏱️  ReAct HITL 中断 | 耗时: {_loop_elapsed*1000:.0f}ms | "
+                f"共 {step} 步 | 高危工具: {[c.get('name') for c in dangerous_calls]}"
+            )
+            return partial_answer, reasoning_trace, dangerous_calls
+
+        # ── Observation：执行工具（全部为安全工具，受熔断器保护），记录观察 ──
         _t0 = time.perf_counter()
         tool_messages = await _order_tools_breaker.call(
             executor.execute_with_fallback, tool_calls, state_ctx
@@ -1170,7 +1240,8 @@ async def _react_order_loop(
     # 剥离内部推理，只保留 【回复】 标记之后的用户可见内容
     final_answer = _extract_user_reply(final_answer)
 
-    return final_answer, reasoning_trace
+    # 第三个返回值：无高危待确认调用（正常完成）
+    return final_answer, reasoning_trace, []
 
 
 async def order_node(state: State) -> Dict[str, Any]:
@@ -1251,7 +1322,7 @@ async def order_node(state: State) -> Dict[str, Any]:
             )
             logger.info(f"订单节点启用 ReAct 推理，最大迭代 {_REACT_MAX_ITERATIONS} 步")
 
-            final_answer, reasoning_trace = await _react_order_loop(
+            final_answer, reasoning_trace, pending_dangerous_calls = await _react_order_loop(
                 llm_with_tools=llm_with_tools,
                 tools=tools,
                 executor=executor,
@@ -1264,14 +1335,33 @@ async def order_node(state: State) -> Dict[str, Any]:
                 stream_queue=stream_queue,
             )
 
-            state.order_summary = final_answer
             state.reasoning_trace = reasoning_trace
-            state.status = StateStatus.SUCCESS
 
-            logger.info(
-                f"订单节点 ReAct 完成：共 {len([t for t in reasoning_trace if t['type'] == 'action'])} 次工具调用，"
-                f"{len(reasoning_trace)} 步推理"
-            )
+            # ── HITL：检测到高危待确认调用，暂停流程等待用户二次确认 ──
+            if pending_dangerous_calls:
+                dangerous_names = [c.get("name") for c in pending_dangerous_calls]
+                dangerous_descs = [_DANGEROUS_TOOL_DESC.get(n, n) for n in dangerous_names]
+                state.hitl_pending = {
+                    "tool_calls": pending_dangerous_calls,
+                    "order_id": order_id,
+                    "tenant_id": tenant_id,
+                    "descriptions": dangerous_descs,
+                    "partial_answer": final_answer,
+                }
+                state.order_summary = None
+                state.status = StateStatus.SUCCESS
+                logger.info(
+                    f"订单节点 HITL 中断：高危操作 {dangerous_descs} 待用户确认，"
+                    f"order_id={order_id}"
+                )
+            else:
+                state.order_summary = final_answer
+                state.hitl_pending = None
+                state.status = StateStatus.SUCCESS
+                logger.info(
+                    f"订单节点 ReAct 完成：共 {len([t for t in reasoning_trace if t['type'] == 'action'])} 次工具调用，"
+                    f"{len(reasoning_trace)} 步推理"
+                )
         else:
             # ══ 降级模式：单次 LLM 调用（原有逻辑）══
             prompt = ORDER_AGENT_PROMPT_TEMPLATE.format(
@@ -1349,6 +1439,149 @@ async def order_node(state: State) -> Dict[str, Any]:
     state.retry_attempts = 0
     _node_success = (state.status == StateStatus.SUCCESS)
     await metrics_collector.track_node_execution("order_node", (time.perf_counter() - _start), success=_node_success)
+    return state
+
+
+async def hitl_confirm_node(state: State) -> Dict[str, Any]:
+    """HITL 确认节点：高危操作执行前，中断图执行等待用户二次确认。
+
+    使用 LangGraph 内置的 interrupt() 实现：
+    - 中断时：将高危操作详情发给用户，图暂停
+    - 恢复时：interrupt() 返回用户决定（"approved" / "rejected"）
+    """
+    _start = time.perf_counter()
+    logger.info("进入节点: HITL确认节点， state.hitl_pending: %s", state.hitl_pending)
+
+    pending = state.hitl_pending or {}
+    descriptions = pending.get("descriptions", [])
+    tool_calls = pending.get("tool_calls", [])
+    order_id = pending.get("order_id", "")
+
+    # 构造面向用户的确认信息
+    ops_text = "、".join(descriptions)
+    confirm_detail = []
+    for tc in tool_calls:
+        name = tc.get("name", "")
+        args = tc.get("args", {})
+        desc = _DANGEROUS_TOOL_DESC.get(name, name)
+        detail_parts = [f"操作: {desc}"]
+        if args.get("order_id"):
+            detail_parts.append(f"订单号: {args['order_id']}")
+        if args.get("reason"):
+            detail_parts.append(f"原因: {args['reason']}")
+        if args.get("amount"):
+            detail_parts.append(f"金额: {args['amount']}")
+        if args.get("new_address"):
+            detail_parts.append(f"新地址: {args['new_address']}")
+        confirm_detail.append(" | ".join(detail_parts))
+
+    hitl_payload = {
+        "type": "hitl_confirmation",
+        "message": f"即将对订单 {order_id} 执行以下操作：{ops_text}，请确认是否继续？",
+        "operations": confirm_detail,
+        "order_id": order_id,
+    }
+
+    logger.info(f"HITL确认节点：中断等待用户确认，操作={ops_text}，order_id={order_id}")
+
+    # ── 核心：调用 interrupt() 中断图执行 ──
+    # 中断时 hitl_payload 会返回给调用方（API 层）
+    # 恢复时 interrupt() 返回用户传入的值（通过 Command(resume=...)）
+    user_decision = interrupt(hitl_payload)
+
+    logger.info(f"HITL确认节点：用户决定={user_decision}")
+
+    # 将用户决定写入 hitl_pending 供后续节点使用
+    pending["user_decision"] = user_decision
+    state.hitl_pending = pending
+
+    await metrics_collector.track_node_execution(
+        "hitl_confirm_node", (time.perf_counter() - _start), success=True
+    )
+    return state
+
+
+async def hitl_execute_node(state: State) -> Dict[str, Any]:
+    """HITL 执行节点：根据用户确认结果，执行或取消高危操作。
+
+    - 用户批准（approved）：执行待确认的高危工具调用，生成最终回复
+    - 用户拒绝（rejected / 其他）：取消操作，返回友好提示
+    """
+    _start = time.perf_counter()
+    logger.info("进入节点: HITL执行节点")
+
+    pending = state.hitl_pending or {}
+    user_decision = str(pending.get("user_decision", "")).strip().lower()
+    tool_calls = pending.get("tool_calls", [])
+    order_id = pending.get("order_id", "")
+    tenant_id = pending.get("tenant_id", "default")
+    descriptions = pending.get("descriptions", [])
+    ops_text = "、".join(descriptions)
+
+    if user_decision == "approved":
+        # ── 用户确认：执行高危工具调用 ──
+        logger.info(f"HITL执行节点：用户已确认，执行操作 {ops_text}")
+
+        tools = [
+            get_order_detail, cancel_order, modify_order_address,
+            apply_refund, get_logistics_info, lookup_skill, read_reference,
+        ]
+        executor = SafeToolExecutor(tools, fallback_model=llm)
+        state_ctx = {
+            "context": state.order_summary or "",
+            "order_id": order_id,
+            "tenant_id": tenant_id,
+        }
+
+        try:
+            tool_messages = await _order_tools_breaker.call(
+                executor.execute_with_fallback, tool_calls, state_ctx
+            )
+            results = [msg.content for msg in tool_messages]
+            exec_result = "\n".join(results)
+
+            # 记录推理链路
+            for tc, tm in zip(tool_calls, tool_messages):
+                state.reasoning_trace.append({
+                    "step": len(state.reasoning_trace) + 1,
+                    "type": "observation",
+                    "content": f"[HITL已确认] {tm.content}",
+                })
+
+            # 调用 LLM 将工具执行结果转换为面向用户的友好回复
+            summary_prompt = (
+                f"你是一位专业的客服，用户已确认执行了{ops_text}操作（订单号：{order_id}）。\n"
+                f"工具执行结果如下：\n{exec_result}\n\n"
+                f"请基于以上结果，用友好专业的语气给用户一个简洁的回复，告知操作结果。"
+            )
+            msg = await _llm_main_breaker.call(llm.ainvoke, summary_prompt)
+            state.order_summary = str(getattr(msg, "content", msg)).strip()
+            state.status = StateStatus.SUCCESS
+            logger.info(f"HITL执行节点：操作{ops_text}执行成功，order_id={order_id}")
+
+        except Exception as e:
+            logger.error(f"HITL执行节点：工具执行失败: {e}")
+            state.order_summary = f"抱歉，{ops_text}操作执行时遇到问题，请稍后重试或联系人工客服。"
+            state.status = StateStatus.FAILED
+    else:
+        # ── 用户拒绝：取消操作 ──
+        logger.info(f"HITL执行节点：用户拒绝操作，取消 {ops_text}")
+        state.order_summary = f"好的，已为您取消{ops_text}操作。如需其他帮助，请随时告诉我。"
+        state.status = StateStatus.SUCCESS
+        state.reasoning_trace.append({
+            "step": len(state.reasoning_trace) + 1,
+            "type": "thought",
+            "content": f"[HITL] 用户拒绝了{ops_text}操作，已取消",
+        })
+
+    # 清除 HITL 待确认状态
+    state.hitl_pending = None
+    state.retry_attempts = 0
+
+    await metrics_collector.track_node_execution(
+        "hitl_execute_node", (time.perf_counter() - _start),
+        success=(state.status == StateStatus.SUCCESS),
+    )
     return state
 
 
@@ -1475,6 +1708,15 @@ _ORDER_ID_CHECK_MAP = {
 _KB_BRANCH_MAP = {"has_kb": END, "no_kb": "handoff"}
 
 
+def _post_order(state: State) -> str:
+    """订单节点后路由：检查是否有高危操作待 HITL 确认。"""
+    if state.hitl_pending:
+        return "hitl_confirm"
+    return "end"
+
+_ORDER_POST_MAP = {"hitl_confirm": "hitl_confirm", "end": END}
+
+
 def _construct_graph_core(*, streaming: bool = False) -> StateGraph:
     """统一构图核心函数。
     
@@ -1483,21 +1725,24 @@ def _construct_graph_core(*, streaming: bool = False) -> StateGraph:
 
     利用 LangGraph 并行 fan-out/fan-in 机制，长期记忆加载与意图识别并行执行：
 
-    START ──┬── load_memory(短期记忆) → intent(意图识别) ──┬── intent_post(汇合) → 路由分发
-            └── load_long_term_memory(长期记忆) ──────────┘
+    START ──┬── load_memory_and_intent(短期记忆+意图识别) ──┬── intent_post(汇合) → 路由分发
+            └── load_long_term_memory(长期记忆) ────────────┘
       ├─ 模糊意图 / 槽位缺失 → clarify → END（反问用户）
-      ├─ order → order_id_check → order / order_id_ask / handoff
+      ├─ order → order_id_check → order → (HITL?) → hitl_confirm → hitl_execute → END
       ├─ faq → query_rewrite → kb → END / handoff
       ├─ human → handoff → END
       ├─ chitchat → direct → END
       └─ FAILED → fallback → END
+
+    注意：load_memory + intent 必须合并为同一个图节点（load_memory_and_intent），
+    确保两条并行分支从 START 到 intent_post 的深度一致（均为 2），
+    否则 LangGraph 的 fan-in 汇合会被每条入边分别触发（intent_post 执行多次）。
     """
     g = StateGraph(State)
 
-    # ── 并行分支节点 ──
-    g.add_node("load_memory", load_memory_node)
+    # ── 并行分支节点（两条分支深度均为 START→节点→intent_post = 2）──
+    g.add_node("load_memory_and_intent", load_memory_and_intent_node, retry_policy=SmartRetryPolicy.create_policy("intent_llm"))
     g.add_node("load_long_term_memory", load_long_term_memory_node)
-    g.add_node("intent", intent_node, retry_policy=SmartRetryPolicy.create_policy("intent_llm"))
     g.add_node("intent_post", intent_post_node)
 
     # ── 后续处理节点 ──
@@ -1511,15 +1756,18 @@ def _construct_graph_core(*, streaming: bool = False) -> StateGraph:
     g.add_node("direct", direct_node_stream if streaming else direct_node, retry_policy=SmartRetryPolicy.create_policy("direct_llm"))
     g.add_node("fallback", fallback_node)
 
-    # ── 并行 fan-out：从 START 同时启动两个分支 ──
-    # 分支 1：短期记忆加载 → 意图识别（意图识别阶段不需要长期记忆）
-    g.add_edge(START, "load_memory")
-    g.add_edge("load_memory", "intent")
+    # ── HITL 节点：高危操作二次确认 ──
+    g.add_node("hitl_confirm", hitl_confirm_node)
+    g.add_node("hitl_execute", hitl_execute_node)
+
+    # ── 并行 fan-out：从 START 直接扇出两个分支 ──
+    # 分支 1：短期记忆加载 + 意图识别（合并为单节点，确保与分支 2 同深度）
+    g.add_edge(START, "load_memory_and_intent")
     # 分支 2：长期记忆加载（与分支 1 并行执行）
     g.add_edge(START, "load_long_term_memory")
 
-    # ── 并行 fan-in：两个分支在 intent_post 节点汇合 ──
-    g.add_edge("intent", "intent_post")
+    # ── 并行 fan-in：两个分支在 intent_post 节点汇合（深度均为 2，只执行一次）──
+    g.add_edge("load_memory_and_intent", "intent_post")
     g.add_edge("load_long_term_memory", "intent_post")
 
     # ── 路由分发（从 intent_post 节点开始，原 intent 节点的路由逻辑不变）──
@@ -1528,14 +1776,19 @@ def _construct_graph_core(*, streaming: bool = False) -> StateGraph:
     g.add_edge("query_rewrite", "kb")
     g.add_conditional_edges("order_id_check", _post_order_id_check, _ORDER_ID_CHECK_MAP)
     g.add_conditional_edges("kb", _post_kb, _KB_BRANCH_MAP)
-    g.add_edge("order", END)
+
+    # ── HITL 路由：order → (hitl_pending?) → hitl_confirm → hitl_execute → END ──
+    g.add_conditional_edges("order", _post_order, _ORDER_POST_MAP)
+    g.add_edge("hitl_confirm", "hitl_execute")
+    g.add_edge("hitl_execute", END)
+
     g.add_edge("order_id_ask", END)
     g.add_edge("handoff", END)
     g.add_edge("direct", END)
     g.add_edge("fallback", END)
 
     mode_label = "流式" if streaming else "普通"
-    logger.info(f"graph构建完毕（{mode_label}模式，含并行记忆加载）")
+    logger.info(f"graph构建完毕（{mode_label}模式，含并行记忆加载 + HITL）")
     return g
 
 
@@ -1721,6 +1974,48 @@ async def _run_graph_core(state: State, *, streaming: bool = False, stream_queue
 async def run_graph(state: State):
     """普通模式执行图"""
     return await _run_graph_core(state, streaming=False)
+
+
+async def resume_graph(thread_id: str, tenant_id: str, user_decision: str):
+    """从 HITL 中断处恢复图执行。
+
+    当用户对高危操作做出确认/拒绝决定后，通过此函数恢复之前被 interrupt() 暂停的图。
+    
+    Args:
+        thread_id: 会话线程 ID（必须与被中断的请求一致）
+        tenant_id: 租户 ID
+        user_decision: 用户决定（"approved" 表示确认，其他表示拒绝）
+    """
+    _graph_start = datetime.now()
+    logger.info(f"resume_graph: thread_id={thread_id}, decision={user_decision}")
+
+    compiled_template = _get_compiled_graph_template()
+    checkpointer_dsn = config.get_checkpointer_dsn(tenant_id)
+    async with AsyncPostgresSaver.from_conn_string(checkpointer_dsn) as memory:
+        await memory.setup()
+        chain = _bind_checkpointer(compiled_template, memory)
+        robust_runner = Robust(chain, memory)
+        try:
+            result = await asyncio.wait_for(
+                robust_runner.resume_from_interrupt(thread_id, user_decision),
+                timeout=_GRAPH_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"resume_graph 超时 ({_GRAPH_TIMEOUT}s) thread_id={thread_id}")
+            result = {
+                "route": "fallback",
+                "fallback": "抱歉，操作处理超时，请稍后重试或联系人工客服。",
+                "sources": [],
+            }
+        except Exception:
+            logger.error(f"resume_graph 失败 {traceback.format_exc()}")
+            result = {
+                "route": "fallback",
+                "fallback": "抱歉，操作处理异常，请稍后重试或联系人工客服。",
+                "sources": [],
+            }
+        logger.info(f"resume_graph 执行完毕: thread_id={thread_id}")
+        return result
 
 
 # [优化] 以下是原始 run_graph 的完整实现，已被 _run_graph_core 替代

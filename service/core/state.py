@@ -130,3 +130,7 @@ class State:
     # ── ReAct 推理链路追踪 ────────────────────────────────────────
     # 记录订单节点 ReAct 推理的每一步：思考(thought)、行动(action)、观察(observation)
     reasoning_trace: List[Dict[str, Any]] = field(default_factory=list)
+
+    # ── HITL（Human-in-the-Loop）人工确认 ──────────────────────────
+    # 高危操作待确认详情（非空时表示正在等待用户二次确认）
+    hitl_pending: Optional[Dict[str, Any]] = None

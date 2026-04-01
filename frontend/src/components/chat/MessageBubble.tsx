@@ -7,6 +7,7 @@ import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import {
   Copy, Check, Quote, ChevronDown, ChevronUp,
   Bot, User as UserIcon, AlertCircle,
+  ShieldAlert, CheckCircle2, XCircle,
 } from 'lucide-react'
 import type { Message } from '../../types/chat'
 import { copyToClipboard, formatMessageTime } from '../../utils/helpers'
@@ -15,10 +16,12 @@ import toast from 'react-hot-toast'
 interface Props {
   message: Message
   onQuote?: (msg: Message) => void
+  /** HITL 确认回调 */
+  onHitlConfirm?: (decision: 'approved' | 'rejected') => void
 }
 
 /** 消息气泡组件 */
-export default function MessageBubble({ message, onQuote }: Props) {
+export default function MessageBubble({ message, onQuote, onHitlConfirm }: Props) {
   const [copied, setCopied] = useState(false)
   const [showSources, setShowSources] = useState(false)
   const isUser = message.role === 'user'
@@ -87,6 +90,50 @@ export default function MessageBubble({ message, onQuote }: Props) {
             <div className="flex items-center gap-2 text-red-400">
               <AlertCircle className="h-4 w-4 shrink-0" />
               <span className="text-sm">{message.error}</span>
+            </div>
+          ) : message.hitl?.requires_confirmation ? (
+            /* ── HITL 高危操作确认卡片 ── */
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 text-amber-400">
+                <ShieldAlert className="h-5 w-5 shrink-0" />
+                <span className="text-sm font-medium">需要您的确认</span>
+              </div>
+              <p className="text-sm text-slate-300">{message.content}</p>
+              {message.hitl.operations.length > 0 && (
+                <div className="space-y-1">
+                  {message.hitl.operations.map((op, i) => (
+                    <div
+                      key={i}
+                      className="flex items-center gap-2 rounded-lg bg-amber-500/10 border border-amber-500/20 px-3 py-2 text-xs text-amber-200"
+                    >
+                      <span className="font-mono">{i + 1}.</span>
+                      <span>{op}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {onHitlConfirm && (
+                <div className="flex items-center gap-2 pt-1">
+                  <motion.button
+                    whileHover={{ scale: 1.02 }}
+                    whileTap={{ scale: 0.98 }}
+                    onClick={() => onHitlConfirm('approved')}
+                    className="flex items-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-sm font-medium text-white transition-colors"
+                  >
+                    <CheckCircle2 className="h-4 w-4" />
+                    确认执行
+                  </motion.button>
+                  <motion.button
+                    whileHover={{ scale: 1.02 }}
+                    whileTap={{ scale: 0.98 }}
+                    onClick={() => onHitlConfirm('rejected')}
+                    className="flex items-center gap-1.5 rounded-xl bg-slate-600 hover:bg-slate-500 px-4 py-2 text-sm font-medium text-white transition-colors"
+                  >
+                    <XCircle className="h-4 w-4" />
+                    取消操作
+                  </motion.button>
+                </div>
+              )}
             </div>
           ) : (
             <div className="markdown-body">

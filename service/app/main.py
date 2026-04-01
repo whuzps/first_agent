@@ -66,7 +66,7 @@ from core.observability import (
 from core.preprocessing import transcribe_audio
 from core.suggest import gen_suggest_questions
 import graph.graph as graph
-from graph.graph import run_graph, run_graph_stream, warmup_graph_templates
+from graph.graph import run_graph, run_graph_stream, resume_graph, warmup_graph_templates
 import core.mq as _mq
 import app.gradio_ui as gradio_ui
 from auth.security_middleware import RedactionMiddleware, build_default_config, sanitize_dict
@@ -171,6 +171,11 @@ class BatchEvaluationRequest(BaseModel):
     cases: List[EvaluationCaseRequest]
     faith_threshold: Optional[float] = 0.85
     relev_threshold: Optional[float] = 0.7
+
+class HitlConfirmRequest(BaseModel):
+    """HITL 高危操作确认请求"""
+    thread_id: str
+    decision: str  # "approved" 或 "rejected"
 
 class SingleEvaluationRequest(BaseModel):
     case: EvaluationCaseRequest
@@ -666,6 +671,37 @@ def measure_latency(func):
 # ── 对话接口 ──────────────────────────────────────────────────────────────────
 # =========================================================================
 
+
+async def _auto_reject_stale_hitl(thread_id: str, tenant_id: str) -> None:
+    """前置检查：若指定 thread 有未处理的 HITL 挂起状态，自动拒绝并恢复图执行。
+
+    场景：
+      - 用户收到确认弹窗后未操作，直接发了新消息
+      - HITL 超时后用户才回来（Redis key 已过期，但 checkpoint 中图仍 interrupted）
+    两种情况都需要先把图从 interrupted 状态恢复（以 rejected 身份），
+    才能正常处理新的用户输入。
+    """
+    pending = await _mq.get_hitl_pending(thread_id)
+    if pending is None:
+        return
+
+    logger.info(
+        f"[HITL自动拒绝] 检测到 thread_id={thread_id} 存在未处理的 HITL 挂起，"
+        f"order_id={pending.get('order_id')}，自动拒绝并恢复图"
+    )
+    try:
+        await resume_graph(
+            thread_id=thread_id,
+            tenant_id=tenant_id,
+            user_decision="rejected",
+        )
+        logger.info(f"[HITL自动拒绝] 图已恢复: thread_id={thread_id}")
+    except Exception as e:
+        logger.warning(f"[HITL自动拒绝] 恢复图失败（非致命，将尝试正常处理）: {e}")
+    finally:
+        await _mq.clear_hitl_pending(thread_id)
+
+
 @app.post("/chat")
 @token_bucket_limit("60/minute", key_func=get_user_id_or_ip)
 @token_bucket_limit("1000/hour", key_func=get_tenant_id_key)
@@ -682,13 +718,103 @@ async def chat(req: ChatRequest, request: Request):
     if cmd is not None:
         return cmd
 
+    # ── 前置检查：若该 thread 存在未处理的 HITL 挂起，自动拒绝并恢复图 ──
+    await _auto_reject_stale_hitl(thread_id, tenant_id)
+
     state = State(thread_id=thread_id, query=query_text, history=None,
                   tenant_id=tenant_id, user_id=user_id,
                   quoted_message=req.quoted_message, images=req.images or None)
     result = await run_graph(state)
 
+    # ── HITL 中断检测：图被 interrupt() 暂停，需要用户二次确认 ──
+    if isinstance(result, dict) and result.get("__interrupted__"):
+        interrupt_info = result.get("__interrupt_info__") or {}
+        logger.info(f"HITL 中断：thread_id={thread_id}，等待用户确认")
+        _msg = interrupt_info.get("message", "即将执行高危操作，请确认是否继续？")
+        _ops = interrupt_info.get("operations", [])
+        _oid = interrupt_info.get("order_id", "")
+        hitl_state = await _mq.register_hitl_pending(
+            thread_id=thread_id, order_id=_oid,
+            operations=_ops, message=_msg,
+        )
+        return {
+            "route": "hitl_confirm",
+            "answer": _msg,
+            "sources": [],
+            "trace_id": get_trace_id(),
+            "hitl": {
+                "thread_id": thread_id,
+                "operations": _ops,
+                "order_id": _oid,
+                "requires_confirmation": True,
+                "expires_at": hitl_state.get("expires_at"),
+                "timeout_seconds": _mq.HITL_TIMEOUT,
+            },
+        }
+
     route, answer, sources = determine_answer(result)
     _post_process_tasks(thread_id, user_id, tenant_id, query_text, answer)
+    return {"route": route, "answer": answer, "sources": sources, "trace_id": get_trace_id()}
+
+
+@app.post("/chat/confirm")
+@token_bucket_limit("60/minute", key_func=get_user_id_or_ip)
+async def chat_confirm(req: HitlConfirmRequest, request: Request):
+    """HITL 高危操作确认接口：用户对挂起的高危操作做出确认或拒绝决定。
+
+    前端收到 route="hitl_confirm" 的响应后，展示确认对话框。
+    用户点击「确认」或「取消」后，调用本接口恢复图执行。
+
+    Request Body:
+        thread_id: 会话线程 ID（必须与被中断的请求一致）
+        decision: "approved"（确认执行）或 "rejected"（取消操作）
+    """
+    tenant_id = request.headers.get("X-Tenant-ID") or request.query_params.get("tenant") or "default"
+    user_id = _get_user_id_from_request(request)
+    decision = req.decision.strip().lower()
+
+    if decision not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="decision 必须是 approved 或 rejected")
+
+    # ── 过期校验：HITL 挂起状态是否已超时 ──
+    pending = await _mq.get_hitl_pending(req.thread_id)
+    if pending is None:
+        logger.warning(f"HITL 确认接口：挂起状态不存在或已过期，thread_id={req.thread_id}")
+        # Redis key 已过期，但 checkpoint 中图可能仍 interrupted，自动 reject 恢复
+        try:
+            await resume_graph(thread_id=req.thread_id, tenant_id=tenant_id, user_decision="rejected")
+        except Exception:
+            pass
+        return {
+            "route": "fallback",
+            "answer": "操作确认已超时，系统已自动取消本次操作。如需继续，请重新发起。",
+            "sources": [],
+            "trace_id": get_trace_id(),
+        }
+
+    logger.info(
+        f"HITL 确认接口：thread_id={req.thread_id}，decision={decision}，user_id={user_id}"
+    )
+
+    try:
+        result = await resume_graph(
+            thread_id=req.thread_id,
+            tenant_id=tenant_id,
+            user_decision=decision,
+        )
+    except Exception as e:
+        logger.error(f"HITL 恢复执行失败: {e}", exc_info=True)
+        return {
+            "route": "fallback",
+            "answer": "抱歉，操作处理异常，请稍后重试或联系人工客服。",
+            "sources": [],
+            "trace_id": get_trace_id(),
+        }
+    finally:
+        await _mq.clear_hitl_pending(req.thread_id)
+
+    route, answer, sources = determine_answer(result)
+    _post_process_tasks(req.thread_id, user_id, tenant_id, "", answer)
     return {"route": route, "answer": answer, "sources": sources, "trace_id": get_trace_id()}
 
 
@@ -728,6 +854,9 @@ async def chat_stream(req: ChatRequest, request: Request):
     cmd = await handle_command(query_text, thread_id)
     if cmd is not None:
         return cmd
+
+    # ── 前置检查：若该 thread 存在未处理的 HITL 挂起，自动拒绝并恢复图 ──
+    await _auto_reject_stale_hitl(thread_id, tenant_id)
 
     images = req.images or None
     trace_id = get_trace_id()
@@ -818,22 +947,50 @@ async def chat_stream(req: ChatRequest, request: Request):
                 await _write_inline_stream(event)
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
-            route, answer, sources = determine_answer(graph_task.result())
-            if not streamed_tokens and answer:
-                if not ttft_recorded:
-                    ttft_recorded = True
-                    _record_ttft(ttft_start, "内联兜底非流式")
-                token_event = {"type": "token", "content": answer}
-                await _write_inline_stream(token_event)
-                yield f"data: {json.dumps(token_event, ensure_ascii=False)}\n\n"
+            graph_result = graph_task.result()
 
-            done_event = {"type": "done", "route": route, "answer": answer, "sources": sources, "trace_id": trace_id}
-            await _write_inline_stream(done_event)
-            yield f"data: {json.dumps(done_event, ensure_ascii=False)}\n\n"
+            # ── HITL 中断检测（流式模式） ──
+            if isinstance(graph_result, dict) and graph_result.get("__interrupted__"):
+                interrupt_info = graph_result.get("__interrupt_info__") or {}
+                _msg = interrupt_info.get("message", "即将执行高危操作，请确认是否继续？")
+                _ops = interrupt_info.get("operations", [])
+                _oid = interrupt_info.get("order_id", "")
+                # 在 Redis 中注册 HITL 挂起状态（带 TTL，超时自动过期）
+                hitl_state = await _mq.register_hitl_pending(
+                    thread_id=thread_id, order_id=_oid,
+                    operations=_ops, message=_msg,
+                )
+                hitl_event = {
+                    "type": "hitl_confirm",
+                    "message": _msg,
+                    "operations": _ops,
+                    "order_id": _oid,
+                    "thread_id": thread_id,
+                    "trace_id": trace_id,
+                    "expires_at": hitl_state.get("expires_at"),
+                    "timeout_seconds": _mq.HITL_TIMEOUT,
+                }
+                await _write_inline_stream(hitl_event)
+                yield f"data: {json.dumps(hitl_event, ensure_ascii=False)}\n\n"
+                finished = True
+                _record_stream_metric("success", time.perf_counter() - _consume_start, thread_id)
+            else:
+                route, answer, sources = determine_answer(graph_result)
+                if not streamed_tokens and answer:
+                    if not ttft_recorded:
+                        ttft_recorded = True
+                        _record_ttft(ttft_start, "内联兜底非流式")
+                    token_event = {"type": "token", "content": answer}
+                    await _write_inline_stream(token_event)
+                    yield f"data: {json.dumps(token_event, ensure_ascii=False)}\n\n"
 
-            finished = True
-            _record_stream_metric("success", time.perf_counter() - _consume_start, thread_id)
-            _post_process_tasks(thread_id, user_id, tenant_id, query_text, answer)
+                done_event = {"type": "done", "route": route, "answer": answer, "sources": sources, "trace_id": trace_id}
+                await _write_inline_stream(done_event)
+                yield f"data: {json.dumps(done_event, ensure_ascii=False)}\n\n"
+
+                finished = True
+                _record_stream_metric("success", time.perf_counter() - _consume_start, thread_id)
+                _post_process_tasks(thread_id, user_id, tenant_id, query_text, answer)
 
         except Exception as e:
             logger.error(f"/chat/stream 内联兜底异常: {e}", exc_info=True)
@@ -963,8 +1120,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                             yield f"id: {msg_id}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
 
                             evt_type = event.get("type")
-                            if evt_type in ("done", "error"):
-                                _record_if_needed("success" if evt_type == "done" else "error")
+                            if evt_type in ("done", "error", "hitl_confirm"):
+                                _record_if_needed("success" if evt_type in ("done", "hitl_confirm") else "error")
                                 return
             finally:
                 try:

@@ -8,7 +8,7 @@ import ChatInput from './ChatInput'
 import { useChatStore } from '../../stores/chatStore'
 import { chatService } from '../../services'
 import { subscribeSuggestions, getGreeting } from '../../services/api'
-import type { Message, QuotedMessage } from '../../types/chat'
+import type { Message, QuotedMessage, HitlInfo } from '../../types/chat'
 import type { GreetingResponse } from '../../types/api'
 
 /** 聊天主视图 */
@@ -85,9 +85,17 @@ export default function ChatView() {
               updateMessage(assistantId, { content: accumulated || '', error: errMsg })
               toast.error(errMsg)
             },
+            /* ── 流式 HITL 确认回调 ── */
+            (hitlInfo, hitlMessage) => {
+              updateMessage(assistantId, {
+                content: hitlMessage,
+                route: 'hitl_confirm',
+                hitl: hitlInfo,
+              })
+            },
           )
         } else {
-          /* ── 非流式输出路径（原逻辑）── */
+          /* ── 非流式输出路径 ── */
           const resp = await chatService.sendMessage(
             { content: text, images, audio, quotedMessage: quoted },
             tid || undefined,
@@ -98,12 +106,21 @@ export default function ChatView() {
             if (newTid) setThreadId(newTid)
           }
 
-          updateMessage(assistantId, {
-            content: resp.answer,
-            sources: resp.sources,
-            route: resp.route,
-            suggestions: resp.suggestions,
-          })
+          /* ── 非流式 HITL 确认响应 ── */
+          if (resp.route === 'hitl_confirm' && resp.hitl) {
+            updateMessage(assistantId, {
+              content: resp.answer,
+              route: resp.route,
+              hitl: resp.hitl,
+            })
+          } else {
+            updateMessage(assistantId, {
+              content: resp.answer,
+              sources: resp.sources,
+              route: resp.route,
+              suggestions: resp.suggestions,
+            })
+          }
         }
 
         /* ── 建议问题（两个路径共享）── */
@@ -129,6 +146,41 @@ export default function ChatView() {
       }
     },
     [currentSession, threadId, createSession, addMessage, updateMessage, setLoading, setThreadId],
+  )
+
+  /* ── HITL 高危操作确认 ── */
+  const handleHitlConfirm = useCallback(
+    async (msgId: string, hitlInfo: HitlInfo, decision: 'approved' | 'rejected') => {
+      // 禁用确认按钮：清除 hitl 标记
+      updateMessage(msgId, {
+        hitl: { ...hitlInfo, requires_confirmation: false },
+      })
+      setLoading(true)
+
+      const resultId = uuid()
+      addMessage({
+        id: resultId,
+        role: 'assistant',
+        content: '',
+        timestamp: new Date(),
+      })
+
+      try {
+        const resp = await chatService.confirmHitl(hitlInfo.thread_id, decision)
+        updateMessage(resultId, {
+          content: resp.answer,
+          sources: resp.sources,
+          route: resp.route,
+        })
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : '操作处理失败'
+        updateMessage(resultId, { content: '', error: msg })
+        toast.error(msg)
+      } finally {
+        setLoading(false)
+      }
+    },
+    [addMessage, updateMessage, setLoading],
   )
 
   /* ── 快捷问题 ── */
@@ -186,6 +238,11 @@ export default function ChatView() {
                 key={msg.id}
                 message={msg}
                 onQuote={(m) => setQuotedMessage({ id: m.id, content: m.content })}
+                onHitlConfirm={
+                  msg.hitl?.requires_confirmation
+                    ? (decision) => handleHitlConfirm(msg.id, msg.hitl!, decision)
+                    : undefined
+                }
               />
             ))}
 
