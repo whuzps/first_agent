@@ -107,6 +107,9 @@ service/logs/ragas_reports/
 # 其他本地运行数据
 service/backup/
 
+# Claude Code
+CLAUDE.md
+
 # =========================
 # 保留需纳入版本管理的目录说明
 # =========================

@@ -33,7 +33,7 @@
 9. [安全与限流](#9-安全与限流)
 10. [基础设施与部署](#10-基础设施与部署)
 11. [质量评估体系](#11-质量评估体系)
-12. [开发文档](#12-当前工作--todo)
+12. [已完成工作](#12-已完成工作)
 
 ---
 
@@ -1057,6 +1057,67 @@ python eval_agent.py --output my_report
 - 日志可部署ELK，高效收集、存储、分析和监控大量的日志数据
 
 
-## 12. 当前工作 & TODO
+## 12. 已完成工作
 
-[开发文档](/service/docs/开发文档.md)
+### 12.1 学习 SKILL
+
+- [Anthropics Skills 仓库](https://github.com/anthropics/skills)
+- [Claude Skill 文档](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview)
+- [Claude Skill 文档中文版](https://claudecn.com/docs/agent-skills/)
+- [如何写出好的 SKILL](https://github.com/datawhalechina/hello-agents/blob/main/Extra-Chapter/Extra08-%E5%A6%82%E4%BD%95%E5%86%99%E5%87%BA%E5%A5%BD%E7%9A%84Skill.md)
+- [Claude Skill 最佳实践](https://claudecn.com/docs/agent-skills/best-practices/)
+
+### 12.2 引入 SKILL
+
+在订单操作中引入 SKILL，由 SKILL 指导 LLM 选择并调用工具 + 处理调用结果：
+
+- 文件目录：`/skills/order_skill/*`
+- 代码分支：`feature/skills`
+- 实现代码：[skill_tool](service/tools/skill_tool.py)
+
+> **思考**：现在的 SKILL 靠提示词触发，软约束（不一定执行 lookup_skill）
+
+### 12.3 短期/长期记忆并行加载优化
+
+由于加载长期记忆（embedding + 搜索）比较耗时，且意图识别可以只考虑短期记忆 → 拆分短期记忆和长期记忆，利用 LangGraph 的并行机制：
+
+```
+START ──┬── load_memory(短期记忆) → intent(意图识别) ──┬── intent_post(汇合节点) → 路由分发
+        └── load_long_term_memory(长期记忆) ──────────┘
+```
+
+**踩坑记录：**
+- **问题**：并行节点后的节点执行了两次，state 合并出现问题
+- **原因**：两条并行分支到达汇合节点的深度不同（2 个节点 vs 1 个节点）；LangGraph 在深度不一致时，不会把两条入边视为同一个 fan-out group 的汇合，而是每条入边分别触发下游节点
+- **解决方案**：将 `load_memory + intent` 合并为单个图节点（或者在长期记忆分支加一个虚拟节点）
+
+### 12.4 HITL (Human-in-the-Loop) 机制
+
+加入 HITL 机制，针对申请退款、取消订单等高危操作，需要用户二次确认。LangGraph 自带 `interrupt()` + `Command`，支持中断与恢复。
+
+**问题**：HITL 中断给用户后，用户如果一直不操作怎么办？
+- 用户发新消息时会冲突 — 同一个 thread_id 上 `ainvoke()` 新输入，但图还在 interrupted 状态
+- 无自动取消机制 — 资源白白占用
+
+**解决方案**：利用 Redis 的 TTL 机制实现 HITL 状态管理：
+
+```
+用户发消息 ──→ [防线1] API层前置检查 ──→ [防线2] Robust层checkpoint检测 ──→ ainvoke()
+                   │                              │
+                   ▼                              ▼
+           Redis HITL key 存在？            checkpoint 有残留中断？
+           → 自动 reject + 恢复图          → 自动 reject + 恢复图
+```
+
+**具体改动：**
+
+| 文件 | 改动内容 |
+|------|----------|
+| `service/core/mq.py` | HITL 状态管理（Redis 带 TTL）：`register_hitl_pending()`、`get_hitl_pending()`、`clear_hitl_pending()` |
+| `service/app/main.py` | API 层前置检查 + 过期校验：`_auto_reject_stale_hitl()`、`/chat/confirm` 过期校验 |
+| `service/core/robust.py` | Checkpoint 级兜底：`_clear_stale_interrupt()` |
+| `service/tasks/chat_task.py` | Worker 路径适配：HITL 中断时调用 `register_hitl_pending`，`hitl_confirm` 事件携带超时信息 |
+
+**超时时间配置**：环境变量 `HITL_TIMEOUT_SECONDS` 控制，默认 300 秒（5 分钟）。
+
+![HITL](service/docs/images/HITL_image.png)
